@@ -2,11 +2,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize_scalar # type: ignore
 from mpl_toolkits.mplot3d import Axes3D   # type: ignore # noqa: F401 (needed for projection='3d')
+import time
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PARAMETERS
 # ══════════════════════════════════════════════════════════════════════════════
-a         = 1    # a > 0: controls tilt, depth asymmetry between wells (only defined for |a|<8/(3sqrt3) ~ 1.5396)
+a         = 0.001    # a > 0: controls tilt, depth asymmetry between wells (only defined for |a|<8/(3sqrt3) ~ 1.5396)
 n         = 50      # number of random starting points per method
 dx        = 0.005   # step size, traditional GD
 eta_theta = 0.005   # step size for theta, smoothed GD
@@ -159,6 +160,8 @@ print("TRADITIONAL GD")
 print("=" * 60)
 
 trad_steps = []
+trad_times = []
+
 trad_hits  = 0
 trad_trajs = [None] * n_plot
 f_trad_trial0 = []   # f values along trial 0 for monotone check
@@ -169,6 +172,8 @@ for i in range(n):
         traj = [curr.copy()]
     if i == 0:
         f_trad_trial0.append(float(f_eval(curr[0], curr[1])))
+
+    t_start = time.time()
 
     for j in range(max_it):
         g    = grad_f(curr)
@@ -182,6 +187,9 @@ for i in range(n):
             break
     else:
         trad_steps.append(max_it)
+    
+    t_end = time.time()
+    trad_times.append(t_end - t_start)
     
     if i < n_plot:
         trad_trajs[i] = np.array(traj)
@@ -219,6 +227,8 @@ print("SMOOTHED GD")
 print("=" * 60)
 
 smooth_steps = []
+smooth_times = []
+
 smooth_hits  = 0
 smooth_trajs = [None] * n_plot
 sigma_trace  = np.full((n, max_it + 1), sigma_min)  # sigma values for all trials
@@ -231,6 +241,9 @@ for i in range(n):
         traj = [curr.copy()]
 
     sigma_trace[i, 0] = sigma0
+
+    t_start = time.time()
+
     for j in range(max_it):
 
         # Sample z_1, ..., z_{N_mc}  ~  N(0, sigma^2 I_2)
@@ -261,6 +274,9 @@ for i in range(n):
             break
     else:
         smooth_steps.append(max_it)
+
+    t_end = time.time()
+    smooth_times.append(t_end - t_start) 
 
     if i < n_plot:
         smooth_trajs[i] = np.array(traj)
@@ -340,6 +356,11 @@ plt.show()
 #   - May briefly INCREASE if theta passes through oscillatory region
 #   - Floored at sigma_min (never collapses to 0)
 # ══════════════════════════════════════════════════════════════════════════════
+avg_trad_time = np.mean(trad_times)
+avg_smooth_time = np.mean(smooth_times)
+
+print(f"Traditional GD Average Execution Time Per Trial: {avg_trad_time:.4f} seconds")
+print(f"Smoothed GD Average Execution Time Per Trial:    {avg_smooth_time:.4f} seconds")
 
 mean_sigma_trace = np.mean(sigma_trace, axis=0)  # average over all trials
 fig2, ax2 = plt.subplots(figsize=(8, 4))
