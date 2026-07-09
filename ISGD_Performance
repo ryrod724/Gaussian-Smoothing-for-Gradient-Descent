@@ -1,0 +1,186 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# ==============================================================================
+# PARAMETER SWEEP GRID SETUP
+# ==============================================================================
+n         = 50       # number of random starting points per method (from SteinGD.py)
+dx        = 0.005   # step size, traditional GD (from SteinGD.py)
+eta_theta = 5e-3   # step size for theta, smoothed GD (from SteinGD.py)
+eta_sigma = 5e-4    # step size for sigma, smoothed GD (from SteinGD.py)
+N_mc      = 500     # Monte Carlo samples per iteration (from SteinGD.py)
+max_it    = 3000    # maximum iterations before giving up (from SteinGD.py)
+tol       = 1e-2    # convergence criterion: ||grad_f(theta)|| < tol (from SteinGD.py)
+sigma_min = 0.01    # sigma floor (from SteinGD.py)
+hit_r     = 0.01    # radius around global min for declaring success (from SteinGD.py)
+
+# Grid dimensions (25x25 execution settings)
+a_vals = np.linspace(0.01, 1.51, 25)
+sigma_vals = np.linspace(0.01, 1.51, 25)
+
+# Shared initial random coordinates uniform on [-2, 2]^2 (from SteinGD.py)
+np.random.seed(42)
+initial_points = (np.random.rand(2, n) - 0.5) * 4
+
+desktop_dir = os.path.expanduser("~/Desktop")
+heatmap_file = os.path.join(desktop_dir, "parameter_sweep_heatmap.png")
+decay_file = os.path.join(desktop_dir, "sigma_decay_trajectories.png")
+
+grid_accuracy = np.zeros((25, 25))
+grid_iterations = np.zeros((25, 25))
+all_sigma_histories = []
+
+# ==============================================================================
+# BLOCK 1: TRADITIONAL GRADIENT DESCENT BASELINE (PRINT ONLY)
+# ==============================================================================
+print("=" * 80)
+print("RUNNING TRADITIONAL GRADIENT DESCENT BASELINE")
+print("=" * 80)
+
+for a in a_vals:
+    curr_tgd = initial_points.copy()
+    active_mask_tgd = np.ones(n, dtype=bool)
+    it_taken_tgd = np.zeros(n)
+    
+    coeffs = [4.0, 0.0, -4.0, a]
+    roots = np.roots(coeffs)
+    p_glob_x = min(roots[np.isreal(roots)].real)
+    
+    for j in range(max_it):
+        if not np.any(active_mask_tgd):
+            break
+        gx = 4 * curr_tgd[0]**3 - 4 * curr_tgd[0] + a
+        gy = 2 * curr_tgd[1]
+        
+        curr_tgd[0, active_mask_tgd] -= dx * gx[active_mask_tgd]
+        curr_tgd[1, active_mask_tgd] -= dx * gy[active_mask_tgd]
+        
+        g_mags = np.sqrt(gx**2 + gy**2)
+        it_taken_tgd[active_mask_tgd] = j + 1
+        active_mask_tgd = active_mask_tgd & (g_mags >= tol)
+        
+    dist_to_glob = np.sqrt((curr_tgd[0] - p_glob_x)**2 + (curr_tgd[1] - 0.0)**2)
+    success_rate_tgd = (np.sum(dist_to_glob < hit_r) / n) * 100
+    print(f"Asymmetry a = {a:.2f} | Baseline Success = {success_rate_tgd:5.1f}% | Avg Iterations = {np.mean(it_taken_tgd):6.1f}")
+
+print("\nBaseline complete. Commencing Pure Zeroth-Order Monte Carlo Stein Sweep...\n")
+
+# ==============================================================================
+# BLOCK 2: VECTORIZED SWEEP USING MC INTEGRATION + STEIN'S ESTIMATORS
+# ==============================================================================
+print("Executing 625-cell parameter grid sweep...")
+
+for row_idx, a in enumerate(a_vals):
+    # Pure black box function definition (from SteinGD.py)
+    def f_blackbox(x, y):
+        return (1.0 - x**2)**2 + y**2 + a * x
+        
+    coeffs = [4.0, 0.0, -4.0, a]
+    roots = np.roots(coeffs)
+    p_glob_x = min(roots[np.isreal(roots)].real)
+    
+    for col_idx, sigma0 in enumerate(sigma_vals):
+        curr = initial_points.copy()
+        sigma = np.full(n, sigma0)
+        active_mask = np.ones(n, dtype=bool)
+        it_taken = np.zeros(n)
+        
+        cell_sigma_history = np.zeros(max_it)
+        
+        for j in range(max_it):
+            cell_sigma_history[j] = np.mean(sigma)
+            
+            if not np.any(active_mask):
+                if j > 0:
+                    cell_sigma_history[j:] = cell_sigma_history[j-1]
+                break
+            
+            # Draw standard normal perturbations: u ~ N(0, I)
+            u = np.random.randn(2, n, N_mc)
+            
+            # Map perturbations via broadcasting: P = \theta + \sigma * u (from SteinGD.py)
+            Px = curr[0, :, None] + sigma[:, None] * u[0, :, :]
+            Py = curr[1, :, None] + sigma[:, None] * u[1, :, :]
+            
+            # Evaluate raw objective values without accessing any derivatives
+            f_evals = f_blackbox(Px, Py)
+            
+            # Pure Zeroth-Order Stein expectation formulation for Position Gradient
+            stein_grad_x = np.mean(f_evals * u[0, :, :], axis=-1) / sigma
+            stein_grad_y = np.mean(f_evals * u[1, :, :], axis=-1) / sigma
+            
+            # Pure Zeroth-Order Stein expectation formulation for Scale Parameter Gradient
+            u_norm_sq = u[0, :, :]**2 + u[1, :, :]**2
+            grad_sig = np.mean(f_evals * (u_norm_sq - 2.0), axis=-1) / sigma
+            
+            # Apply Coupled Gradient Descent steps directly (Descent direction: -Grad)
+            curr[0, active_mask] -= eta_theta * stein_grad_x[active_mask]
+            curr[1, active_mask] -= eta_theta * stein_grad_y[active_mask]
+            
+            sigma[active_mask] = np.maximum(
+                sigma[active_mask] - eta_sigma * grad_sig[active_mask], 
+                sigma_min
+            )
+            
+            # Track active convergence iterations
+            it_taken[active_mask] = j + 1
+            
+            # Exact convergence metric mapping from SteinGD.py
+            gx_real = 4 * curr[0]**3 - 4 * curr[0] + a
+            gy_real = 2 * curr[1]
+            real_g_mags = np.sqrt(gx_real**2 + gy_real**2)
+            active_mask = active_mask & (real_g_mags >= tol)
+            
+        final_dist = np.sqrt((curr[0] - p_glob_x)**2 + (curr[1] - 0.0)**2)
+        grid_accuracy[row_idx, col_idx] = (np.sum(final_dist < hit_r) / n) * 100
+        grid_iterations[row_idx, col_idx] = np.mean(it_taken)
+        
+        all_sigma_histories.append(cell_sigma_history)
+
+# ==============================================================================
+# IMAGE EXPORT 1: MATRIX HEATMAP
+# ==============================================================================
+fig, ax = plt.subplots(figsize=(16, 13))
+sns.heatmap(grid_accuracy, annot=True, fmt=".0f", cmap="RdYlGn", linewidths=0.5, 
+            cbar_kws={'label': 'Global Minimum Success Rate (%)'},
+            xticklabels=[f"{v:.2f}" for v in sigma_vals], 
+            yticklabels=[f"{v:.2f}" for v in a_vals], ax=ax)
+
+for y in range(grid_accuracy.shape[0]):
+    for x in range(grid_accuracy.shape[1]):
+        ax.text(x + 0.5, y + 0.8, f"{int(grid_iterations[y, x])} it", 
+                horizontalalignment='center', verticalalignment='center',
+                fontsize=7, color='black', alpha=0.7)
+
+ax.set_title("Zeroth-Order Stein Isotropic Smoothing Grid Sweep Evaluation Matrix", fontsize=14, fontweight='bold', pad=15)
+ax.set_xlabel(r"Initial Variance Scale Parameter ($\sigma_0$)", fontsize=11, labelpad=10)
+ax.set_ylabel("Landscape Geometry Asymmetry Level ($a$)", fontsize=11, labelpad=10)
+plt.xticks(rotation=45, ha='right')
+plt.yticks(rotation=0)
+plt.tight_layout()
+plt.savefig(heatmap_file, dpi=300)
+plt.close()
+
+# ==============================================================================
+# IMAGE EXPORT 2: MASTER AVERAGE SIGMA DECAY PLOT (AVERAGE VERTICAL LINE REMOVED)
+# ==============================================================================
+fig, ax = plt.subplots(figsize=(10, 6))
+master_average_curve = np.mean(all_sigma_histories, axis=0)
+
+ax.plot(master_average_curve, label=r"Ensemble Grand Mean ($\mu_{\sigma}$ Across 625 Parameter Settings)", color="darkorchid", lw=3)
+ax.axhline(y=sigma_min, color="grey", linestyle=":", label=r"Hard Minimum Variance Clamp ($\sigma_{min} = 0.01$)")
+
+ax.set_title(r"Global Average Scale Parameter ($\sigma$) Trajectory Profile Across Full Grid Sweep", fontsize=12, fontweight='bold', pad=15)
+ax.set_xlabel("Optimization Execution Iterations ($j$)", fontsize=11)
+ax.set_ylabel(r"Expected Smoothing Window Radius ($\mathbb{E}[\sigma]$)", fontsize=11)
+ax.set_xlim(0, max_it)
+ax.grid(True, linestyle="--", alpha=0.5)
+ax.legend(frameon=True, facecolor="white", edgecolor="none")
+plt.tight_layout()
+plt.savefig(decay_file, dpi=300)
+plt.close()
+
+print(f"[SUCCESS] Pure Monte Carlo integration grid sweep with Stein estimators saved to Desktop.")
