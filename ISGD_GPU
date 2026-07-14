@@ -1,0 +1,229 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import time
+
+# ==============================================================================
+# DEVICE SETUP
+# ==============================================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ==============================================================================
+# PARAMETER SWEEP HYPERPARAMETERS
+# ==============================================================================
+d         = 2        # problem dimension 
+n         = 50       # number of random starting points per configuration
+dx        = 0.005    # step size for traditional GD
+h_fd      = 1e-5     # finite-difference step size for black-box TGD baseline
+eta_theta = 5e-3     # step size for theta, smoothed GD
+eta_sigma = 5e-4     # step size for sigma, smoothed GD
+N_mc      = 500      # Monte Carlo samples per iteration
+max_it    = 2000     # maximum iterations budget
+sigma_min = 0.01     # sigma noise floor floor
+hit_r     = 0.01     # success radius around the true global minimum
+
+n_a, n_sigma = 25, 25
+a_vals = np.linspace(0.01, 1.51, n_a)
+sigma_vals = np.linspace(0.01, 1.51, n_sigma)
+G = n_a * n_sigma   # 625 parameter grid cells
+
+np.random.seed(42)
+initial_points_np = (np.random.rand(d, n) - 0.5) * 4   # shape (d, n)
+
+# Output path setup
+desktop_dir = "/content"
+heatmap_file = os.path.join(desktop_dir, "parameter_sweep_heatmap.png")
+decay_file = os.path.join(desktop_dir, "sigma_decay_trajectories.png")
+
+def f_blackbox_batched(x, y, a_bcast):
+    """Pure black-box target objective (Double-Well landscape)"""
+    return (1.0 - x ** 2) ** 2 + y ** 2 + a_bcast * x
+
+# ==============================================================================
+# 1. BLACK-BOX TRADITIONAL GRADIENT DESCENT BASELINE
+# ==============================================================================
+print("=" * 80)
+print("RUNNING BLACK-BOX TRADITIONAL GRADIENT DESCENT BASELINE")
+print("=" * 80)
+
+def compute_p_glob(vals):
+    p_glob = np.zeros_like(vals)
+    for i, a in enumerate(vals):
+        roots = np.roots([4.0, 0.0, -4.0, a])
+        p_glob[i] = min(roots[np.isreal(roots)].real)
+    return p_glob
+
+p_glob_row = compute_p_glob(a_vals)
+p_glob_col_tgd = torch.tensor(p_glob_row, dtype=torch.float64, device=device).view(n_a, 1)
+
+init_pts = torch.tensor(initial_points_np, dtype=torch.float64, device=device)          # (2, n)
+curr_tgd = init_pts.unsqueeze(0).repeat(n_a, 1, 1).clone()                              # (n_a, 2, n)
+a_col = torch.tensor(a_vals, dtype=torch.float64, device=device).view(n_a, 1)           # (n_a, 1)
+
+# History tracking arrays for post-hoc validation
+tgd_dist_history = torch.zeros((n_a, n, max_it), dtype=torch.float64, device=device)
+
+for j in range(max_it):
+    # Log current proximity to target minimum
+    cx, cy = curr_tgd[:, 0, :], curr_tgd[:, 1, :]
+    tgd_dist_history[:, :, j] = torch.sqrt((cx - p_glob_col_tgd) ** 2 + cy ** 2)
+    
+    # Fully Black-Box Gradient Estimation via Central Finite Differences
+    f_left_x  = f_blackbox_batched(cx - h_fd, cy, a_col)
+    f_right_x = f_blackbox_batched(cx + h_fd, cy, a_col)
+    f_left_y  = f_blackbox_batched(cx, cy - h_fd, a_col)
+    f_right_y = f_blackbox_batched(cx, cy + h_fd, a_col)
+    
+    gx_bb = (f_right_x - f_left_x) / (2.0 * h_fd)
+    gy_bb = (f_right_y - f_left_y) / (2.0 * h_fd)
+    
+    # Standard GD Update step
+    curr_tgd[:, 0, :] -= dx * gx_bb
+    curr_tgd[:, 1, :] -= dx * gy_bb
+
+# Post-hoc evaluation of hitting time and success rates for TGD baseline
+tgd_inside_target = tgd_dist_history < hit_r
+tgd_has_converged, tgd_hit_indices = torch.max(tgd_inside_target, dim=2)
+tgd_hitting_time = torch.where(tgd_has_converged, tgd_hit_indices.double() + 1.0, torch.full_like(tgd_hit_indices, float(max_it), dtype=torch.float64))
+
+success_tgd = tgd_has_converged.float().mean(dim=1) * 100
+avg_it_tgd = tgd_hitting_time.mean(dim=1)
+
+for i, a in enumerate(a_vals):
+    print(f"Asymmetry a = {a:.2f} | Baseline Success = {success_tgd[i].item():5.1f}% | "
+          f"Avg Hitting Time = {avg_it_tgd[i].item():6.1f} it")
+
+print("\nBaseline complete. Commencing GPU-vectorized ISGD grid sweep...\n")
+
+# ==============================================================================
+# 2. ISGD ALGORITHM GRID SWEEP (Full execution & post-hoc Hitting Time Evaluation)
+# ==============================================================================
+print(f"Executing {G}-cell parameter grid sweep for all {max_it} iterations...")
+
+a_grid_np = np.repeat(a_vals, n_sigma)
+sigma0_grid_np = np.tile(sigma_vals, n_a)
+p_glob_grid_np = np.repeat(p_glob_row, n_sigma)
+
+dt = torch.float32
+a_t = torch.tensor(a_grid_np, dtype=dt, device=device).view(G, 1)
+p_glob_t = torch.tensor(p_glob_grid_np, dtype=dt, device=device).view(G, 1)
+
+init_pts32 = init_pts.to(dt)
+curr = init_pts32.unsqueeze(0).repeat(G, 1, 1).clone()                     # (G, 2, n)
+sigma = torch.tensor(sigma0_grid_np, dtype=dt, device=device).view(G, 1).repeat(1, n).clone()  # (G, n)
+
+# History storage logs allocated to GPU for massive vectorized operations
+isgd_dist_history = torch.zeros((G, n, max_it), dtype=dt, device=device)
+sigma_history = torch.zeros(max_it, dtype=torch.float64)
+
+# Best-seen configuration logs
+best_x = curr[:, 0, :].clone()
+best_y = curr[:, 1, :].clone()
+best_dist = torch.sqrt((best_x - p_glob_t) ** 2 + best_y ** 2)
+
+t0 = time.time()
+for j in range(max_it):
+    sigma_history[j] = sigma.mean().item()
+
+    # Vectorized true landscape distance logging
+    cx, cy = curr[:, 0, :], curr[:, 1, :]
+    current_dist = torch.sqrt((cx - p_glob_t) ** 2 + cy ** 2)
+    isgd_dist_history[:, :, j] = current_dist
+
+    # Update global best-seen trajectory configurations
+    improved = current_dist < best_dist
+    best_dist = torch.where(improved, current_dist, best_dist)
+    best_x = torch.where(improved, cx, best_x)
+    best_y = torch.where(improved, cy, best_y)
+
+    # Draw standard normal perturbations across the full execution field
+    u = torch.randn(G, d, n, N_mc, device=device, dtype=dt)
+
+    Px = cx.unsqueeze(-1) + sigma.unsqueeze(-1) * u[:, 0, :, :]
+    Py = cy.unsqueeze(-1) + sigma.unsqueeze(-1) * u[:, 1, :, :]
+
+    # Query black-box oracle values at our sampling clouds
+    f_evals = f_blackbox_batched(Px, Py, a_t.unsqueeze(-1))
+
+    # Calculate Zeroth-Order Stein Estimators 
+    stein_grad_x = (f_evals * u[:, 0, :, :]).mean(dim=-1) / sigma
+    stein_grad_y = (f_evals * u[:, 1, :, :]).mean(dim=-1) / sigma
+
+    u_norm_sq = (u ** 2).sum(dim=1)  # Norm squared dynamically handles dimension d
+    grad_sig = (f_evals * (u_norm_sq - float(d))).mean(dim=-1) / sigma
+
+    # Continuous parameters update step
+    curr[:, 0, :] -= eta_theta * stein_grad_x
+    curr[:, 1, :] -= eta_theta * stein_grad_y
+    sigma = torch.clamp(sigma - eta_sigma * grad_sig, min=sigma_min)
+
+    if (j + 1) % 400 == 0:
+        print(f"  Processed iteration {j + 1}/{max_it} | Elapsed time: {time.time() - t0:.1f}s")
+
+# Post-hoc extraction of Hitting Time and True Empirical Success Matrix
+isgd_inside_target = isgd_dist_history < hit_r
+isgd_has_converged, isgd_hit_indices = torch.max(isgd_inside_target, dim=2)
+
+# Unbiased penalty: Failures receive the max_it cost boundary
+isgd_hitting_time = torch.where(
+    isgd_has_converged, 
+    isgd_hit_indices.float() + 1.0, 
+    torch.full_like(isgd_hit_indices, float(max_it), dtype=dt)
+)
+
+success_rate = (best_dist < hit_r).float().mean(dim=1) * 100
+grid_accuracy = success_rate.view(n_a, n_sigma).cpu().numpy()
+
+grid_iterations_t = isgd_hitting_time.mean(dim=1)
+grid_iterations = grid_iterations_t.view(n_a, n_sigma).cpu().numpy()
+
+print(f"\nISGD complete. Final evaluation matrix grand mean success rate: {success_rate.mean().item():5.1f}%")
+
+# ==============================================================================
+# IMAGE EXPORT 1: MATRIX HEATMAP (accuracy % + average hitting time)
+# ==============================================================================
+fig, ax = plt.subplots(figsize=(16, 13))
+labels = np.empty_like(grid_accuracy, dtype=object)
+for i in range(grid_accuracy.shape[0]):
+    for jx in range(grid_accuracy.shape[1]):
+        labels[i, jx] = f"{grid_accuracy[i, jx]:.0f}%\n{grid_iterations[i, jx]:.0f} it"
+
+sns.heatmap(grid_accuracy, annot=labels, fmt="", cmap="RdYlGn", linewidths=0.5,
+            annot_kws={"size": 6, "linespacing": 0.9},
+            cbar_kws={'label': 'Global Minimum Success Rate (%)'},
+            xticklabels=[f"{v:.2f}" for v in sigma_vals],
+            yticklabels=[f"{v:.2f}" for v in a_vals], ax=ax)
+
+ax.set_title("ISGD Sweep Matrix: Success Rate % & True Average Hitting Time", fontsize=14, fontweight='bold', pad=15)
+ax.set_xlabel(r"Initial Smoothing Variance ($\sigma_0$)", fontsize=11, labelpad=10)
+ax.set_ylabel(r"Landscape Asymmetry Level ($\alpha$)", fontsize=11, labelpad=10)
+plt.xticks(rotation=45, ha='right')
+plt.yticks(rotation=0)
+plt.tight_layout()
+plt.savefig(heatmap_file, dpi=300)
+plt.close()
+
+# ==============================================================================
+# IMAGE EXPORT 2: SIGMA DECAY PLOT
+# ==============================================================================
+sigma_history_np = sigma_history.numpy()
+
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.plot(range(1, max_it + 1), sigma_history_np,
+        label=r"Ensemble Grand Mean ($\mu_{\sigma}$ Across Grid)", color="darkorchid", lw=3)
+ax.axhline(y=sigma_min, color="grey", linestyle=":", label=r"Hard Minimum Variance Clamp ($\sigma_{min} = 0.01$)")
+
+ax.set_title(r"Average $\sigma$ Trajectory Across Full Grid Sweep", fontsize=12, fontweight='bold', pad=15)
+ax.set_xlabel("ISGD Execution Iterations ($j$)", fontsize=11)
+ax.set_ylabel(r"Average Smoothing Variance ($\mathbb{E}[\sigma]$)", fontsize=11)
+ax.set_xlim(1, max_it)
+ax.grid(True, linestyle="--", alpha=0.5)
+ax.legend(frameon=True, facecolor="white", edgecolor="none")
+plt.tight_layout()
+plt.savefig(decay_file, dpi=300)
+plt.close()
+
+print(f"[SUCCESS] Corrected results exported to: {heatmap_file} and {decay_file}")
