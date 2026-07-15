@@ -197,7 +197,6 @@ sns.heatmap(grid_accuracy, annot=labels, fmt="", cmap="RdYlGn", linewidths=0.5,
             xticklabels=[f"{v:.2f}" for v in sigma_vals],
             yticklabels=[f"{v:.2f}" for v in a_vals], ax=ax)
 
-ax.set_title("ISGD Sweep Matrix: Success Rate % & True Average Hitting Time", fontsize=14, fontweight='bold', pad=15)
 ax.set_xlabel(r"Initial Smoothing Variance ($\sigma_0$)", fontsize=11, labelpad=10)
 ax.set_ylabel(r"Landscape Asymmetry Level ($\alpha$)", fontsize=11, labelpad=10)
 plt.xticks(rotation=45, ha='right')
@@ -213,12 +212,11 @@ sigma_history_np = sigma_history.numpy()
 
 fig, ax = plt.subplots(figsize=(10, 6))
 ax.plot(range(1, max_it + 1), sigma_history_np,
-        label=r"Ensemble Grand Mean ($\mu_{\sigma}$ Across Grid)", color="darkorchid", lw=3)
-ax.axhline(y=sigma_min, color="grey", linestyle=":", label=r"Hard Minimum Variance Clamp ($\sigma_{min} = 0.01$)")
+        label=r"Ensemble Grand Mean $\mu_{\sigma}$", color="darkorchid", lw=3)
+ax.axhline(y=sigma_min, color="grey", linestyle=":", label=r"Minimum Variance ($\sigma_{min} = 0.01$)")
 
-ax.set_title(r"Average $\sigma$ Trajectory Across Full Grid Sweep", fontsize=12, fontweight='bold', pad=15)
-ax.set_xlabel("ISGD Execution Iterations ($j$)", fontsize=11)
-ax.set_ylabel(r"Average Smoothing Variance ($\mathbb{E}[\sigma]$)", fontsize=11)
+ax.set_xlabel("ISGD Execution Iterations", fontsize=11)
+ax.set_ylabel(r"Average Smoothing Variance", fontsize=11)
 ax.set_xlim(1, max_it)
 ax.grid(True, linestyle="--", alpha=0.5)
 ax.legend(frameon=True, facecolor="white", edgecolor="none")
