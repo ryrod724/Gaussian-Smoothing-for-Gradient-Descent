@@ -1,0 +1,400 @@
+"""
+Directional Gaussian Smoothing for Gradient Descent
+Neural Network Experiment: Isotropic-Smoothed Gradient Descent (ISGD)
+vs. Standard Gradient Descent with exact (autodiff) gradients ("TGD" here
+denotes an oracle, true-gradient baseline.
+
+Architecture: 784 -> 128 -> 64 -> 10 MLP on MNIST.
+  - 784 (input) and 10 (output) are fixed by the problem (28x28 pixel
+    images, 10 digit classes).
+  - 128 and 64 (hidden layer sizes) are architecture choices.
+
+ISGD implements Algorithm 1 from the paper (isotropic smoothed gradient
+descent, Stein's-Lemma-based zeroth-order estimator), augmented with:
+  - baseline subtraction (control variate for variance reduction)
+  - a ceiling on sigma (sigma_max), in addition to the paper's sigma_min floor
+  - gradient-norm clipping on both the theta- and sigma-updates
+all three additions exist to stabilize the estimator at high dimension
+
+Runs on GPU or CPU.
+"""
+
+import os
+import copy
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.func import functional_call, vmap, grad
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+
+# ==============================================================================
+# REPRODUCIBILITY & DEVICE
+# ==============================================================================
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+
+OUTPUT_DIR = "/content" if os.path.isdir("/content") else "."
+
+# ==============================================================================
+# DATA: MNIST (60,000 train / 10,000 test -- fixed by the dataset itself)
+# ==============================================================================
+transform = transforms.Compose([transforms.ToTensor()])
+train_set = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+test_set  = torchvision.datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+
+BATCH_SIZE = 512
+train_loader = torch.utils.data.DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+test_loader  = torch.utils.data.DataLoader(test_set, batch_size=1000, shuffle=False)
+
+# Full test set as one tensor, for confusion matrix / per-class analysis / prediction plots
+test_x_all = test_set.data.float().div(255.0).to(device)
+test_y_all = test_set.targets.to(device)
+
+# ==============================================================================
+# MODEL: 784 -> 128 -> 64 -> 10 MLP
+# ==============================================================================
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(784, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 10)
+
+    def forward(self, x):
+        x = x.view(x.shape[0], -1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+torch.manual_seed(SEED)
+base_model = MLP().to(device)          # single shared initialization
+isgd_model = copy.deepcopy(base_model).to(device)
+tgd_model  = copy.deepcopy(base_model).to(device)
+
+param_names  = [n for n, _ in base_model.named_parameters()]
+param_shapes = [p.shape for p in base_model.parameters()]
+param_numels = [p.numel() for p in base_model.parameters()]
+d = sum(param_numels)
+
+print(f"\nParameter dimension breakdown (d = {d:,}):")
+for name, shape, numel in zip(param_names, param_shapes, param_numels):
+    print(f"  {name:8s} {str(tuple(shape)):>14s}  {numel:>8,}")
+print(f"  {'TOTAL':8s} {'':>14s}  {d:>8,}")
+
+def flat_to_paramdict(theta_flat):
+    parts = torch.split(theta_flat, param_numels)
+    return {name: part.view(shape) for name, part, shape in zip(param_names, parts, param_shapes)}
+
+def loss_from_theta(theta_flat, x, y, model):
+    params = flat_to_paramdict(theta_flat)
+    logits = functional_call(model, params, (x,))
+    return F.cross_entropy(logits, y)
+
+isgd_loss_fn = lambda theta, x, y: loss_from_theta(theta, x, y, isgd_model)
+tgd_loss_fn  = lambda theta, x, y: loss_from_theta(theta, x, y, tgd_model)
+
+isgd_batched_loss = vmap(isgd_loss_fn, in_dims=(0, None, None))   # N perturbed evals, ISGD
+tgd_exact_grad_fn = grad(tgd_loss_fn)                              # exact analytic gradient (autodiff)
+
+with torch.no_grad():
+    theta_isgd0 = torch.cat([p.detach().flatten() for p in isgd_model.parameters()]).to(device)
+    theta_tgd0  = torch.cat([p.detach().flatten() for p in tgd_model.parameters()]).to(device)
+assert torch.allclose(theta_isgd0, theta_tgd0), "ISGD and TGD models must share identical initialization"
+
+# ==============================================================================
+# SHARED BATCH STREAM (both methods see identical data at every iteration)
+# ==============================================================================
+def make_batch_stream(n_steps):
+    it = iter(train_loader)
+    batches = []
+    for _ in range(n_steps):
+        try:
+            x, y = next(it)
+        except StopIteration:
+            it = iter(train_loader)   # exhausted one pass over the 60k images -> reshuffle
+            x, y = next(it)
+        batches.append((x.to(device), y.to(device)))
+    return batches
+
+@torch.no_grad()
+def evaluate_theta(theta_flat, model):
+    """Full 10,000-image held-out test-set accuracy for a flat parameter vector."""
+    params = flat_to_paramdict(theta_flat)
+    correct, total = 0, 0
+    for x, y in test_loader:
+        x, y = x.to(device), y.to(device)
+        logits = functional_call(model, params, (x,))
+        correct += (logits.argmax(dim=1) == y).sum().item()
+        total += y.numel()
+    return correct / total
+
+@torch.no_grad()
+def get_predictions(theta_flat, model):
+    params = flat_to_paramdict(theta_flat)
+    logits = functional_call(model, params, (test_x_all,))
+    return logits.argmax(dim=1), test_y_all
+
+# ==============================================================================
+# HYPERPARAMETERS
+# ==============================================================================
+ITERS           = 1000
+CHECKPOINT_EVERY = 20
+
+# ISGD (Algorithm 1, isotropic case -- matches paper Table 1 where applicable)
+N_MC            = 4000       # Monte Carlo samples per iteration
+SIGMA_0         = 0.05
+SIGMA_MIN       = 1e-3      # paper's floor
+SIGMA_MAX       = 0.5       # NEW: ceiling -- needed for high-dimensional stability
+ETA_THETA_ISGD  = 0.05
+ETA_SIGMA       = 1e-4
+GRAD_CLIP       = 5.0       # NEW: safety net on ||g_theta||; trigger count logged below
+SIGMA_GRAD_CLIP = 2.0       # NEW: safety net on g_sigma; trigger count logged below
+
+# TGD -- exact/oracle gradient via autodiff (NOT the finite-difference black-box
+# TGD used in the double-well section; see accompanying paper text)
+ETA_THETA_TGD   = 0.1
+
+batches = make_batch_stream(ITERS)
+
+# ==============================================================================
+# ISGD TRAINING LOOP
+# ==============================================================================
+theta_isgd = theta_isgd0.clone()
+sigma = SIGMA_0
+
+isgd_log_iters, isgd_loss_hist, isgd_sigma_hist, isgd_acc_hist, isgd_wall_hist = [], [], [], [], []
+isgd_theta_clip_count, isgd_sigma_clip_count = 0, 0
+
+print(f"\nTraining ISGD (N={N_MC} Monte Carlo samples/iteration)...")
+t0 = time.time()
+for k in range(ITERS):
+    x, y = batches[k]
+    with torch.no_grad():
+        u = torch.randn(N_MC, d, device=device)
+        thetas_pert = theta_isgd.unsqueeze(0) + sigma * u
+        f_evals = isgd_batched_loss(thetas_pert, x, y)          # f(theta + sigma u^(j))
+
+        # --- Baseline subtraction (control variate; see paper text) ---
+        baseline = f_evals.mean()
+        f_centered = f_evals - baseline
+
+        g_theta = (f_centered.unsqueeze(1) * u).mean(dim=0) / sigma
+        g_sigma = (f_centered * (u.pow(2).sum(dim=1) - d)).mean() / sigma
+
+        g_theta_norm = g_theta.norm()
+        if g_theta_norm > GRAD_CLIP:
+            g_theta = g_theta * (GRAD_CLIP / g_theta_norm)
+            isgd_theta_clip_count += 1
+        if abs(g_sigma.item()) > SIGMA_GRAD_CLIP:
+            isgd_sigma_clip_count += 1
+        g_sigma = torch.clamp(g_sigma, -SIGMA_GRAD_CLIP, SIGMA_GRAD_CLIP)
+
+        theta_isgd = theta_isgd - ETA_THETA_ISGD * g_theta
+        sigma = min(max(sigma - ETA_SIGMA * g_sigma.item(), SIGMA_MIN), SIGMA_MAX)
+
+    isgd_sigma_hist.append(sigma)
+
+    if k % CHECKPOINT_EVERY == 0 or k == ITERS - 1:
+        with torch.no_grad():
+            curr_loss = loss_from_theta(theta_isgd, x, y, isgd_model).item()
+        acc = evaluate_theta(theta_isgd, isgd_model)
+        isgd_log_iters.append(k)
+        isgd_loss_hist.append(curr_loss)
+        isgd_acc_hist.append(acc)
+        isgd_wall_hist.append(time.time() - t0)
+        print(f"[ISGD] iter {k:4d} | sigma {sigma:.4f} | batch loss {curr_loss:.4f} | test acc {acc*100:.2f}%")
+
+isgd_time = time.time() - t0
+isgd_final_acc = evaluate_theta(theta_isgd, isgd_model)
+isgd_preds, isgd_true = get_predictions(theta_isgd, isgd_model)
+
+# ==============================================================================
+# TGD TRAINING LOOP -- exact analytic gradient via autodiff (oracle baseline)
+# ==============================================================================
+theta_tgd = theta_tgd0.clone()
+tgd_log_iters, tgd_loss_hist, tgd_acc_hist, tgd_wall_hist = [], [], [], []
+
+print("\nTraining TGD (exact gradient via autodiff)...")
+t0 = time.time()
+for k in range(ITERS):
+    x, y = batches[k]
+    g_true = tgd_exact_grad_fn(theta_tgd, x, y)     # exact gradient -- no sampling, no noise
+    with torch.no_grad():
+        theta_tgd = theta_tgd - ETA_THETA_TGD * g_true
+
+    if k % CHECKPOINT_EVERY == 0 or k == ITERS - 1:
+        with torch.no_grad():
+            curr_loss = loss_from_theta(theta_tgd, x, y, tgd_model).item()
+        acc = evaluate_theta(theta_tgd, tgd_model)
+        tgd_log_iters.append(k)
+        tgd_loss_hist.append(curr_loss)
+        tgd_acc_hist.append(acc)
+        tgd_wall_hist.append(time.time() - t0)
+        print(f"[TGD]  iter {k:4d} | batch loss {curr_loss:.4f} | test acc {acc*100:.2f}%")
+
+tgd_time = time.time() - t0
+tgd_final_acc = evaluate_theta(theta_tgd, tgd_model)
+tgd_preds, tgd_true = get_predictions(theta_tgd, tgd_model)
+
+# ==============================================================================
+# ANALYSIS HELPERS
+# ==============================================================================
+def confusion_matrix(preds, trues, n_classes=10):
+    idx = (trues * n_classes + preds).cpu()
+    cm = torch.bincount(idx, minlength=n_classes * n_classes).reshape(n_classes, n_classes)
+    return cm.numpy()
+
+def per_class_accuracy_from_cm(cm):
+    return (cm.diagonal() / cm.sum(axis=1)).tolist()
+
+def iters_to_threshold(iters_log, acc_hist, threshold):
+    for it, acc in zip(iters_log, acc_hist):
+        if acc >= threshold:
+            return it
+    return None   # never reached within the logged checkpoints
+
+isgd_cm = confusion_matrix(isgd_preds, isgd_true)
+tgd_cm  = confusion_matrix(tgd_preds, tgd_true)
+isgd_class_acc = per_class_accuracy_from_cm(isgd_cm)
+tgd_class_acc  = per_class_accuracy_from_cm(tgd_cm)
+
+# ==============================================================================
+# RESULTS SUMMARY
+# ==============================================================================
+print("\n" + "=" * 70)
+print("SUMMARY")
+print("=" * 70)
+print(f"{'Metric':<38}{'ISGD':<16}{'TGD':<16}")
+print(f"{'Final test accuracy (%)':<38}{isgd_final_acc*100:<16.2f}{tgd_final_acc*100:<16.2f}")
+print(f"{'Best test accuracy (%)':<38}{max(isgd_acc_hist)*100:<16.2f}{max(tgd_acc_hist)*100:<16.2f}")
+print(f"{'Wall-clock time (s)':<38}{isgd_time:<16.1f}{tgd_time:<16.1f}")
+print(f"{'Evaluations / iteration':<38}{N_MC:<16d}{'1 (exact grad)':<16}")
+print(f"{'Total misclassified (of 10,000)':<38}"
+      f"{(isgd_preds != isgd_true).sum().item():<16d}{(tgd_preds != tgd_true).sum().item():<16d}")
+
+for thresh in [0.5, 0.7, 0.9]:
+    it_isgd = iters_to_threshold(isgd_log_iters, isgd_acc_hist, thresh)
+    it_tgd  = iters_to_threshold(tgd_log_iters, tgd_acc_hist, thresh)
+    print(f"{'Iterations to reach ' + str(int(thresh*100)) + '% acc':<38}"
+          f"{str(it_isgd):<16}{str(it_tgd):<16}")
+
+print(f"\nISGD gradient-clip diagnostics (out of {ITERS} iterations):")
+print(f"  theta-gradient clipped: {isgd_theta_clip_count} times "
+      f"({100*isgd_theta_clip_count/ITERS:.1f}%)")
+print(f"  sigma-gradient clipped: {isgd_sigma_clip_count} times "
+      f"({100*isgd_sigma_clip_count/ITERS:.1f}%)")
+
+print("\nPer-class test accuracy:")
+print(f"{'Digit':<8}{'ISGD':<10}{'TGD':<10}{'Diff (ISGD-TGD)':<18}")
+for c in range(10):
+    diff = (isgd_class_acc[c] - tgd_class_acc[c]) * 100
+    print(f"{c:<8}{isgd_class_acc[c]*100:<10.2f}{tgd_class_acc[c]*100:<10.2f}{diff:<+18.2f}")
+
+# ==============================================================================
+# PLOTS
+# ==============================================================================
+
+# --- Figure 1: loss / accuracy vs. iteration, plus sigma trajectory ---
+fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
+
+axes[0].plot(isgd_log_iters, isgd_loss_hist, label="ISGD", lw=1.8, marker='o', ms=3)
+axes[0].plot(tgd_log_iters, tgd_loss_hist, label="TGD (exact grad.)", lw=1.8, marker='o', ms=3)
+axes[0].set_xlabel("Iteration"); axes[0].set_ylabel("Batch loss")
+axes[0].set_title("Training loss vs. iteration")
+axes[0].legend(); axes[0].grid(True, linestyle=":", alpha=0.6)
+
+axes[1].plot(isgd_log_iters, [a * 100 for a in isgd_acc_hist], label="ISGD", lw=1.8, marker='o', ms=3)
+axes[1].plot(tgd_log_iters, [a * 100 for a in tgd_acc_hist], label="TGD (exact grad.)", lw=1.8, marker='o', ms=3)
+axes[1].set_xlabel("Iteration"); axes[1].set_ylabel("Test accuracy (%)")
+axes[1].set_title("Test accuracy vs. iteration")
+axes[1].legend(); axes[1].grid(True, linestyle=":", alpha=0.6)
+
+axes[2].plot(range(ITERS), isgd_sigma_hist, color="purple", lw=1.5)
+axes[2].axhline(y=SIGMA_MIN, color="red", linestyle="--", label=f"$\\sigma_{{min}}$={SIGMA_MIN}")
+axes[2].axhline(y=SIGMA_MAX, color="gray", linestyle="--", label=f"$\\sigma_{{max}}$={SIGMA_MAX}")
+axes[2].set_xlabel("Iteration"); axes[2].set_ylabel("$\\sigma$")
+axes[2].set_title("ISGD smoothing parameter trajectory")
+axes[2].legend(); axes[2].grid(True, linestyle=":", alpha=0.6)
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "fig1_training_curves.png"), dpi=300)
+plt.show()
+
+# --- Figure 2: test accuracy vs. WALL-CLOCK TIME (cost-adjusted comparison) ---
+# ISGD does N_MC forward passes/iteration vs. TGD's 1 forward+backward pass,
+# so per-iteration cost differs substantially; this plot compares them on an
+# equal-compute-time footing rather than an equal-iteration-count footing.
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(isgd_wall_hist, [a * 100 for a in isgd_acc_hist], label="ISGD", lw=1.8, marker='o', ms=3)
+ax.plot(tgd_wall_hist, [a * 100 for a in tgd_acc_hist], label="TGD (exact grad.)", lw=1.8, marker='o', ms=3)
+ax.set_xlabel("Wall-clock time (s)"); ax.set_ylabel("Test accuracy (%)")
+ax.set_title("Test accuracy vs. wall-clock time")
+ax.legend(); ax.grid(True, linestyle=":", alpha=0.6)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "fig2_accuracy_vs_walltime.png"), dpi=300)
+plt.show()
+
+# --- Figure 3: confusion matrices ---
+fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+for ax, cm, title in zip(axes, [isgd_cm, tgd_cm], ["ISGD Confusion Matrix", "TGD Confusion Matrix"]):
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_title(title)
+    ax.set_xlabel("Predicted label"); ax.set_ylabel("True label")
+    ax.set_xticks(range(10)); ax.set_yticks(range(10))
+    for i in range(10):
+        for j in range(10):
+            val = cm[i, j]
+            ax.text(j, i, str(val), ha="center", va="center",
+                    color="white" if val > cm.max() / 2 else "black", fontsize=7)
+    plt.colorbar(im, ax=ax, fraction=0.046)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "fig3_confusion_matrices.png"), dpi=300)
+plt.show()
+
+# --- Figure 4: per-class accuracy comparison ---
+fig, ax = plt.subplots(figsize=(9, 5))
+x_pos = np.arange(10)
+width = 0.35
+ax.bar(x_pos - width / 2, [a * 100 for a in isgd_class_acc], width, label="ISGD")
+ax.bar(x_pos + width / 2, [a * 100 for a in tgd_class_acc], width, label="TGD (exact grad.)")
+ax.set_xlabel("Digit class"); ax.set_ylabel("Accuracy (%)")
+ax.set_title("Per-digit test accuracy")
+ax.set_xticks(x_pos); ax.legend(); ax.grid(True, axis="y", linestyle=":", alpha=0.6)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "fig4_per_class_accuracy.png"), dpi=300)
+plt.show()
+
+# --- Figure 5: sample misclassified digits ---
+def plot_misclassified(preds, trues, images, title, n=12):
+    wrong_idx = (preds != trues).nonzero(as_tuple=True)[0]
+    n_show = min(n, len(wrong_idx))
+    fig, axes = plt.subplots(2, 6, figsize=(13, 4.5))
+    fig.suptitle(title)
+    for i, ax in enumerate(axes.flat):
+        if i < n_show:
+            idx = wrong_idx[i].item()
+            ax.imshow(images[idx].cpu(), cmap="gray")
+            ax.set_title(f"true:{trues[idx].item()} pred:{preds[idx].item()}", fontsize=9)
+        ax.axis("off")
+    plt.tight_layout()
+    return fig
+
+plot_misclassified(isgd_preds, isgd_true, test_x_all, "ISGD: Sample Misclassifications")
+plt.savefig(os.path.join(OUTPUT_DIR, "fig5_isgd_misclassified.png"), dpi=300)
+plt.show()
+
+plot_misclassified(tgd_preds, tgd_true, test_x_all, "TGD: Sample Misclassifications")
+plt.savefig(os.path.join(OUTPUT_DIR, "fig6_tgd_misclassified.png"), dpi=300)
+plt.show()
+
+print(f"\nAll figures saved to: {OUTPUT_DIR}")
